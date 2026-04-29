@@ -52,7 +52,7 @@ class LayerNorm(torch.nn.Module):
         # 返回归一化后的结果，以及更新后的残差张量本身。
         return self.rms_forward(x), x
 
-    # 统一的前向传播入口，既支持有残差也支持无残差。
+    # 统一的前向传播入口，既支持有残差也支持无残差。 residual 是 Tensor 或者 None 类型，默认为 None
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         # 如果调用者传入了残差张量，则走“残差相加后再 RMSNorm”的路径。
         if residual is not None:
@@ -89,8 +89,8 @@ if __name__ == "__main__":
         # 记录起始时间。
         start_time = time.time()
         # 执行一次无残差前向传播。
-        _ = layer(x)
-        # 在结束计时前同步 CUDA。
+        _ = layer(x) # core 
+        # 在结束计时前同步 CUDA
         torch.cuda.synchronize()
         # 记录结束时间。
         end_time = time.time()
@@ -99,25 +99,25 @@ if __name__ == "__main__":
     # 计算无残差路径的平均耗时。
     avg_time = sum(times) / len(times)
     # 打印无残差路径的平均耗时。
-    print(f"[Without residuals] Average inference time over 100 runs: {avg_time * 1000:.4f} ms")
+    print(f"[Without residuals] Average inference time over 100 runs: {avg_time * 1000:.4f} ms") 
 
     # 清空耗时列表，准备统计带残差路径。
-    times.clear()
+    times.clear() 
     # 测试 100 次带残差路径的前向传播性能。
     for _ in range(100):
-        # 在开始计时前同步 CUDA。
-        torch.cuda.synchronize()
+        # 在开始计时前同步 CUDA
+        torch.cuda.synchronize() 
         # 记录起始时间。
-        start_time = time.time()
-        # 执行一次带残差的前向传播。
-        _ = layer(x, residual)
+        start_time = time.time() 
+        # 执行一次带残差的前向传播 
+        _ = layer(x, residual) # core
         # 在结束计时前同步 CUDA。
-        torch.cuda.synchronize()
+        torch.cuda.synchronize() 
         # 记录结束时间。
-        end_time = time.time()
+        end_time = time.time()   
         # 将本次耗时加入列表。
-        times.append(end_time - start_time)
+        times.append(end_time - start_time) 
     # 计算带残差路径的平均耗时。
-    avg_time = sum(times) / len(times)
+    avg_time = sum(times) / len(times) 
     # 打印带残差路径的平均耗时。
-    print(f"[With residuals] Average inference time over 100 runs: {avg_time * 1000:.4f} ms")
+    print(f"[With residuals] Average inference time over 100 runs: {avg_time * 1000:.4f} ms") 

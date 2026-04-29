@@ -37,6 +37,10 @@ class SiluAndMul(nn.Module):
     # 定义前向传播函数，输入是一个张量 `x`。
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 按最后一维把输入均分成两块，前半部分赋给 `x`，后半部分赋给 `y`。
+        """
+        内存布局：在前面的 Linear 层中，我们通常直接输出双倍维度的结果，然后在这个模块里“一分为二”。
+        这样在显存中数据是连续的，读取效率最高。
+        """
         x, y = x.chunk(2, -1)
         # 对前半部分做 SiLU，再与后半部分逐元素相乘，并返回结果。
         return F.silu(x) * y
