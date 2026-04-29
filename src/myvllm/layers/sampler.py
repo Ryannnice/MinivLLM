@@ -38,5 +38,5 @@ class SamplerLayer(nn.Module):
         probs = torch.softmax(logits, dim=-1)
         # 使用指数噪声实现近似的 Gumbel-Max 采样，并返回最大值对应的 token 下标。
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
-        # 返回采样后的 token id。
+        # 返回采样后的 [token id]
         return sample_tokens

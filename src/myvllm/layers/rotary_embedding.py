@@ -21,9 +21,9 @@ def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) 
         # 读取输入张量的形状信息：总 token 数、头数、head_dim。
         total_tokens, num_heads, head_dim = x.shape
         # 在 head 维前插入一个维度，让 cos 可以广播到所有注意力头。
-        cos = cos.unsqueeze(1)
+        cos = cos.unsqueeze(1) 
         # 在 head 维前插入一个维度，让 sin 可以广播到所有注意力头。
-        sin = sin.unsqueeze(1)
+        sin = sin.unsqueeze(1) 
 
         # 沿最后一维把输入切成两半，分别作为旋转前的两组坐标。
         x1, x2 = x.chunk(2, dim=-1)
@@ -87,6 +87,7 @@ class RotaryEmbedding(nn.Module):
         self.max_position = max_position
         # 根据标准 RoPE 公式预计算每一对维度的逆频率。
         self.inv_freq = 1 / (base ** (torch.arange(0, self.rotary_embedding, 2) / self.rotary_embedding))
+        # 越往后的维度，频率越小，旋转越慢
 
         # 如果当前选择的是 Llama 3 风格 RoPE，则对逆频率做长上下文修正。
         if is_llama3:
@@ -122,7 +123,7 @@ class RotaryEmbedding(nn.Module):
         # 预生成从 0 到 `max_position - 1` 的位置索引。
         positions = torch.arange(self.max_position).float()
         # 用外积的方式计算每个位置、每个频率对应的相位值。
-        freqs = torch.einsum("i,j -> ij", positions, self.inv_freq)
+        freqs = torch.einsum("i,j -> ij", positions, self.inv_freq)  
 
         # 对相位值取 cos，得到余弦缓存。
         cos = torch.cos(freqs)
