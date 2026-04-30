@@ -1,6 +1,6 @@
 # 文件内容概览：
-# 1. 定义项目里所有并行线性层的基础类与具体实现。
-# 2. 包括普通复制线性层、列并行线性层、行并行线性层、合并列并行层和专用的 QKV 列并行层。
+# 1. 定义项目里所有[并行线性层]的基础类与具体实现。
+# 2. 包括 普通复制线性层、列并行线性层、行并行线性层、合并列并行层和专用的 QKV 列并行层。
 # 3. 同时实现了“如何从完整 checkpoint 权重切出当前 rank 分片”的权重加载逻辑。
 #
 # 在项目中的作用：
@@ -71,15 +71,15 @@ class LinearBase(nn.Module):
 # 用多行注释解释自定义 weight_loader 的使用背景。
 """
 这些自定义的 `weight_loader` 用来解决一个核心问题：
-模型部署时，当前 GPU 上保存的是“被张量并行切分后的参数”；
-但从 checkpoint 读进来的通常是“完整模型参数”。
+模型部署时，当前 GPU 上保存的是 “被张量并行切分后的参数”
+但从 checkpoint 读进来的通常是 “完整模型参数”
 
-因此在加载权重时，不能简单做 `param.data.copy_(loaded_weight)`，
+因此在加载权重时，不能简单做 `param.data.copy_(loaded_weight)`
 而是需要根据当前 rank 和切分方式，先把完整权重切到属于本卡的那一片，再写入本地参数。
 """
 
 
-# 定义最简单的复制式线性层，不做张量并行切分。
+# 定义最简单的[复制式]线性层，不做张量并行切分
 class ReplicatedLinear(LinearBase):
     # 定义初始化函数。
     def __init__(
@@ -102,7 +102,7 @@ class ReplicatedLinear(LinearBase):
         return nn.functional.linear(x, self.weight, self.bias)
 
 
-# 定义列并行线性层：沿输出维度切分。
+# 定义[列并行]线性层：沿输出维度切分。
 class ColumnParallelLinear(LinearBase):
     # 定义初始化函数。
     def __init__(
@@ -113,24 +113,28 @@ class ColumnParallelLinear(LinearBase):
     ):
         # 获取当前张量并行组的总卡数。
         tp_size = dist.get_world_size()
+
         # 列并行要求输出维度能被卡数整除。
         assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
+
         # 传给基类的输出维度是“当前 rank 持有的那一片输出维度”。
         super().__init__(input_size, output_size // tp_size, bias, tp_dim=0)
 
-    # 定义列并行的权重加载逻辑。
+    # 定义[列并行]的权重加载逻辑。
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         # 取出目标参数数据。
         param_data = param.data
-        # 完整权重的第 0 维就是总输出维度。
+        # 完整权重的第 0 维就是总输出维度：output = linear(x, weight, bias)，其中 weight 的形状是：[out_features, in_features]
         full_data_output_size = loaded_weights.size(0)
+
         # 计算每个 rank 理论应拿到多少输出行。
         shard_size = full_data_output_size // self.tp_size
         # 断言切分后大小与本地参数形状一致。
         assert shard_size == param_data.size(0), "Shard size does not match parameter size."
+        
         # 计算当前 rank 在完整输出维上的起始位置。
         start_index = self.tp_rank * shard_size
-        # 从完整权重中沿第 0 维切出本 rank 负责的输出分片。
+        # 从完整权重中沿第 0 维切出本 rank 负责的输出分片。tensor.narrow(dim, start, length)：含义分别是：- dim：沿哪一维切  - start：从哪里开始  - length：取多长
         slided_weight = loaded_weights.narrow(0, start_index, shard_size)
         # 把切出来的分片写入本地参数。
         param_data.copy_(slided_weight)
@@ -161,6 +165,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data = param.data
         # 计算当前要装载的是第几个子矩阵在本地大矩阵中的偏移位置。
         offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
+        
         # 计算当前子矩阵在本 rank 上对应的分片大小。
         shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
         # 在大矩阵参数里先 narrow 到当前子矩阵对应的那一段。
