@@ -60,6 +60,37 @@ flowchart TD
     R --> S[EngineCoreOutput -> OutputProcessor]
 ```
 
+举例子：
+vLLM 调度侧在 GPUModelRunner.execute_model() 里调用 self.model(**model_inputs)，模型内部的 Transformer
+layers 在具体模型的 forward() 里循环执行。  
+
+在 vLLM v1 里，Transformer 前向是在 GPUModelRunner.execute_model() 里触发的，关键调用是：
+vLLM/vllm-upstream/vllm/v1/worker/gpu/model_runner.py:1118
+model_output = self.model(**model_inputs)
+
+这行会进入具体模型类的 forward()。以 Qwen3 为例，调用链大致是：
+EngineCore.step()
+ -> Executor.execute_model()
+ -> GPUWorker.execute_model()
+ -> GPUModelRunner.execute_model()
+ -> self.model(**model_inputs)
+ -> Qwen3ForCausalLM.forward()
+ -> Qwen3Model / Qwen2Model.forward()
+ -> for layer in self.layers: layer(...)
+
+真正逐层执行 Transformer block 的循环在 Qwen2/Qwen3 共享的模型主体里：
+vLLM/vllm-upstream/vllm/model_executor/models/qwen2.py:408
+for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+    hidden_states, residual = layer(positions, hidden_states, residual)
+
+每个 layer(...) 执行一个 decoder layer，里面再执行 attention 和 MLP。以 Qwen3 的 decoder layer 为例：
+vLLM/vllm-upstream/vllm/model_executor/models/qwen3.py:216
+hidden_states = self.self_attn(...)
+hidden_states = self.mlp(hidden_states)
+
+
+
+
 ### 4.1 入口与引擎主循环
 
 - 入口对象是 `vllm/v1/engine/llm_engine.py` 中的 `LLMEngine`。
@@ -418,3 +449,103 @@ Worker 侧 `vllm/v1/worker/gpu/block_table.py` 做两件事：
    - backend 物理布局层
 4. block table 和 slot mapping 必须是显式协议对象；否则调度器和 kernel 层会强耦合。
 5. prefix cache 的真实复杂度在“对齐、block 命中、最后一 token 重算”，这些边界比 cache hit rate 本身更重要。
+
+## 14. 模型与 vLLM 的界限
+
+简短答案：新模型来了，你只要写 `model_executor/models/<name>.py` 一个文件（外加可能少量配置/registry 改动）。vLLM 的调度器、KV cache、attention kernel、采样、CUDA graph、量化、TP/PP/EP 都不用碰。
+
+但"一个文件"不等于"工作量小"——下面拆开看。
+
+### 14.1 界限在哪里：vLLM 的 contract
+
+vLLM 给模型作者画了一条很清楚的线，模型类必须遵守这套接口，剩下的事 vLLM 全包：
+
+| vLLM 负责（model 之外的所有东西） | 模型作者负责（模型类内部） |
+|---|---|
+| Scheduler / continuous batching | 模型层级结构 |
+| PagedAttention KV cache 分配 | 各层调用顺序 |
+| prefill / decode 区分 + attn metadata | Embedding → N×Block → Norm → LMHead |
+| Attention kernel（FlashAttn / FlashInfer / Triton） | 用 vLLM 提供的 Linear / Norm / RoPE / Attention |
+| 量化（FP8 / AWQ / GPTQ / MXFP4 ...） | QKV / MLP 用 ColumnParallel + RowParallel 组合 |
+| TP / PP / EP 通信 | MoE 用 vLLM 的 FusedMoE |
+| CUDA graph / torch.compile | 权重加载映射（HF 名 → 本地切分参数） |
+| Sampler / logits processor | 自己模型独有的算子（如 MLA、Indexer） |
+| HF 权重加载入口 | 实现 `forward(input_ids, positions, ...)` 签名 |
+
+也就是说：只要你的 `forward` 长得"标准"，所有性能/分布式特性都白送。
+
+### 14.2 一个新模型要做的事（按工作量从小到大）
+
+**A. 注册（很小）**
+
+- 在 `vllm/model_executor/models/registry.py` 里加一行 `"DeepseekV4ForCausalLM": ("deepseek_v4", "DeepseekV4ForCausalLM"),`，把 HF `config.architectures[0]` 映射到你的模型类。
+- 如果是新 HF config 类型，可能在 `vllm/transformers_utils/configs/` 加一个适配。
+
+**B. 写模型文件（核心工作）**
+
+看 `qwen3.py`（340 行）vs `deepseek_v4.py`（1568 行）的差距，就能看出工作量分布。
+
+结构上必须有的几样（从已有文件可总结的最小骨架）：
+
+1. `<Model>MLP` — 用 `MergedColumnParallelLinear(gate_up)` + `act_fn` + `RowParallelLinear(down)` 拼出 SwiGLU。
+2. `<Model>Attention` — 用 `QKVParallelLinear` / `MergedQKVParallelLinear` + `get_rope(...)` + `Attention(...)` + `RowParallelLinear(o_proj)`。这里只是"调用"`Attention` 类，真正的 PagedAttention 在 vLLM 内部。
+3. `<Model>DecoderLayer` — `input_layernorm` → `self_attn` → `post_attention_layernorm` → `mlp`，带 residual。
+4. `<Model>Model` — `VocabParallelEmbedding` + `make_layers(num_layers, lambda: DecoderLayer(...))` + 最后一个 `RMSNorm`。
+5. `<Model>ForCausalLM` — 包一层，加 `ParallelLMHead` + `LogitsProcessor`，并实现：
+   - `forward(input_ids, positions, intermediate_tensors, inputs_embeds)` —— 签名固定，对应 `_model_forward` 那次调用。
+   - `compute_logits(hidden_states, sampling_metadata)`。
+   - `load_weights(weights: Iterable[tuple[str, Tensor]])` —— HF 权重名 → 本地参数的映射。
+
+**C. 权重加载（中等，但容易踩坑）**
+
+HF checkpoint 的命名跟你内部参数名几乎不会一一对齐：
+
+- HF 里 `q_proj / k_proj / v_proj` 三份 → 你内部一个合并的 `qkv_proj`。
+- HF 里 `gate_proj / up_proj` 两份 → 你内部一个 `gate_up_proj`。
+- MoE 的 expert 权重命名形态各异。
+
+vLLM 提供 `AutoWeightsLoader` + `WeightsMapper` + `default_weight_loader` 把这事做成"声明式映射"。但每个新模型都要写一遍这张映射表，且要对张量切分维度敏感（前面 ColumnParallel/RowParallel 的讨论就是为这个服务的）。
+
+### 14.3 工程量到底花在哪儿
+
+参考 `deepseek_v4.py` 的 1568 行，可以看出真正费力的是模型本身的"非标准"部分，不是 vLLM 集成：
+
+| 来源 | 占比（粗略） | 例子 |
+|---|---|---|
+| 标准 transformer 骨架（Embed / Layer / LMHead / forward） | 20–30% | 任何模型都长得差不多 |
+| 模型独有算子 | 30–50% | DeepseekV4 的 MLA（Multi-head Latent Attention）、Indexer、Yarn-style RoPE、Mamba/SSM、滑动窗口、interleaved layer 等 |
+| MoE 路由 + expert 并行 | 10–30%（仅 MoE 模型） | FusedMoE、router、bias、shared experts、EP 通信、量化 expert |
+| 权重加载映射 | 5–15% | HF 命名 → 内部命名、合并 QKV/gate_up、stacked params、量化权重 |
+| 量化路径适配 | 0–15% | FP8 / MXFP4 expert、按层跳过量化 (`is_layer_skipped`) |
+| 多模态/视觉/编码器（如果有） | 单独再写一倍 | `deepseek_vl2.py`、`llama4.py` 之类 |
+
+为什么 `qwen3.py` 只有 340 行而 `deepseek_v4.py` 接近 1600 行？前者是"标准 GQA + dense MLP"，几乎全程用 vLLM 现成原语就能拼完；后者引入了 MLA、专用 Indexer、复杂的 MoE 路由（带 bias 的 fused topk）、多种量化路径，这些是算法本身的复杂度，不是 vLLM 把事情搞复杂了。
+
+### 14.4 哪些情况会突破"只改一个文件"的边界
+
+绝大多数模型一个文件就够。下面这些会向 vLLM 内部蔓延：
+
+1. **全新的 attention 形态**（MLA、线性 attention、RWKV、Mamba SSM）
+   → 需要在 `model_executor/layers/` 下新增一个层（`deepseek_v4_attention.py`、`mamba/...`），并且可能要新增一种 attention backend / metadata。这就是为什么 `deepseek_v4.py` 顶部要 `from vllm.model_executor.layers.deepseek_v4_attention import ...`——这部分是 vLLM 团队跟模型作者一起加进去的，不是用户在 model file 里能搞定的。
+2. **新的并行策略**（Expert Parallel 的新变体、Sequence Parallel 新模式）→ 改 `distributed/`、`v1/worker/`。
+3. **新的量化格式** → `model_executor/layers/quantization/` 新增方法。
+4. **新的 KV cache 结构**（如 MLA 的 latent KV、SSM 的 state cache）→ 改 `v1/core/kv_cache_manager.py`、attention metadata、worker。
+5. **新的调度需求**（chunked prefill 的新形式、prefix caching 的新粒度）→ 改 `v1/core/sched/`。
+
+第 1、4 项就是 DeepSeek-V2/V3/V4 真正"贵"的地方——MLA 一上来，vLLM 是要在 KV cache 那一层为它特化的。但这种侵入式改动是模型上游团队 + vLLM core 团队协作的，不是适配普通新模型时要面对的。
+
+### 14.5 对应到 mini-vllm
+
+mini-vllm 把这条边界画得更直白，可以当对照：
+
+- vLLM 提供的能力 ↔ `src/myvllm/layers/`（`linear.py` / `attention.py` / `rotary_embedding.py` / `layernorm.py` / `embedding_head.py` / `sampler.py`）+ `engine/`（scheduler / block manager / model_runner）。
+- 每个模型自己写的部分 ↔ `src/myvllm/models/qwen3.py` / `llama.py`，里面就是"用 layers 拼骨架 + 写 load_weights"。
+- 模型注册 ↔ `engine/model_runner.py.__init__` 里那个根据目录名 `match` 选模型类的位置——加一个 case 即可。
+
+### 14.6 结论
+
+- 不需要"重新实现一遍"：Transformer 主干、attention kernel、KV cache、调度、采样、量化、TP/PP/EP，vLLM 已经给好了。
+- 要做的是"翻译"：把 HF 那份用 `nn.Linear` / `F.scaled_dot_product_attention` 写的 reference 实现，翻译成"用 vLLM 的并行原语 + `Attention` 类拼出来的版本"，再写一份权重名映射。这部分的活儿大约是几百到一千多行 Python，1–3 天到 1–2 周，取决于模型有多怪。
+- 真正"贵"的是模型本身的非标准算子：MLA、Indexer、特殊 RoPE、复杂 MoE 路由、新型 KV state——这些既是论文创新点，也是适配的工程量来源。如果一个新模型只是把 Llama 加宽加深、换 RoPE base，那 200 行就够了；如果它发明了一种新 attention，那它需要在 `layers/` 里加新基础设施，这一步通常不是"用户做模型适配"的范畴，而是 vLLM core 接收新机制的过程。
+
+一句话：vLLM 给 Transformer 划了一道"Lego 接口"，模型作者只搭 Lego，引擎部分不动——除非这个模型自带新形状的积木。
