@@ -11,7 +11,7 @@ vLLM-Ascend 的价值，不在于“把 CUDA 版 vLLM 机械翻译成 NPU 版”
 1. `Platform`：重新定义设备身份、dispatch key、compile backend、attention backend 派发与平台配置注入。
 2. `Worker / Attention runtime`：围绕 `seq_lens_cpu`、ACLGraph、KV layout、paged attention / FIA 路径重建执行翻译层。
 3. `Graph / Compile / Patch`：不是沿用上游 CUDA/Triton 假设，而是单独维护 ACLGraph、torchair、fusion pass 和 meta registration。
-4. `Scheduler / Connector / Host`：把 placeholder token、remote KV、dynamic batch、profiling chunk、HCCL 以及 CPU/NUMA/IRQ 绑核纳入正式系统层。
+4. `Scheduler / Connector / Host`：把 placeholder token、remote KV、dynamic batch、profiling chunk、HCCL 以及 CPU/NUMA/IRQ 亲和性纳入正式系统层。
 
 一句话概括：
 
@@ -97,13 +97,13 @@ Ascend 插件最值得学的，是它如何在不破坏上游大框架的前提�
 - `get_compile_backend()`
 - `get_attn_backend_cls()`
 
-`platform.py` 还会把：
+`platform.py` 还会接管或进一步改写：
 
 - `SLO_limits_for_dynamic_batch`
 - PCP/DCP/flashcomm2 等配置
 - graph wrapper 类名
 
-注入到上游配置对象里。也就是说，Ascend 插件不是等进入 worker 后再偷偷换实现，而是在平台层就决定了整条后续路径。
+其中一部分配置先由 `AscendConfig` 从 `additional_config` 解析，另一部分再由平台层接管到 scheduler/backend/wrapper 选择上。也就是说，Ascend 插件不是等进入 worker 后再偷偷换实现，而是在平台层就决定了整条后续路径。
 
 ### 5.3 `ACLGraphWrapper` 的选择也发生在平台层
 
@@ -161,9 +161,9 @@ Ascend runner 会像 upstream 一样先乐观推进 `optimistic_seq_lens_cpu`，
 
 这说明 Ascend 并不是简单“复用 V2 worker”，而是在 input buffer 协议层保留了设备特有的数据依赖。
 
-### 6.5 `decode_threshold` 也被带进了 runner
+### 6.5 `decode_threshold` 是 runner 与 metadata builder 共同持有的约束
 
-V1 runner 还显式计算 `decode_threshold = 1 + num_speculative_tokens`。这说明 spec decode 在 Ascend world 不是后加优化，而是和 attention 路径选择、graph 兼容性、batch 组织同时建模的。
+V1 runner 会显式计算 `decode_threshold = 1 + num_speculative_tokens`；同时 `attention_v1.py`、`mla_v1.py`、`sfa_v1.py` 中的 metadata builder 也维护同名阈值，并用它约束 NPU fused infer attention 路径。这说明 spec decode 在 Ascend world 不是后加优化，而是和 attention 路径选择、graph 兼容性、batch 组织共同建模的。
 
 ## 7. Attention / KV Runtime：Ascend 的核心增量几乎都在这里
 
@@ -189,10 +189,10 @@ V1 runner 还显式计算 `decode_threshold = 1 + num_speculative_tokens`。这�
 
 其中最有代表性的细节有两个：
 
-1. `get_cudagraph_support()` 直接返回 `ALWAYS`，说明该 backend 天生按 graph 兼容设计。
+1. `get_cudagraph_support()` 在当前实现中直接返回 `ALWAYS`，说明该 metadata builder 显式向上游能力模型宣告 graph-compatible。
 2. `decode_threshold` 会把 speculative token 一起算进去，并显式断言不超过 NPU fused infer attention 的限制。
 
-这说明 graph 不是后来补上的开关，而是 attention runtime 的设计前提。
+这说明 graph 能力不是后来补上的旁路开关，而是 attention runtime 在接口层显式建模的一部分；但某次前向是否真正进入 graph 仍取决于运行时 mode 与 wrapper 分派。
 
 ### 7.3 builder 明确优先使用 `_seq_lens_cpu`
 
@@ -287,13 +287,13 @@ Ascend runtime 会在 paged attention 与 fused infer attention 之间分流，�
 
 ### 9.4 `SchedulerDynamicBatch` 不只是 chunked prefill 开关
 
-[`scheduler_dynamic_batch.py`](https://github.com/vllm-project/vllm-ascend/blob/d1f66849c9ea1459ca6a4c6c213ac3fec2ec1c9c/vllm_ascend/core/scheduler_dynamic_batch.py) 直接围绕：
+[`scheduler_dynamic_batch.py`](https://github.com/vllm-project/vllm-ascend/blob/d1f66849c9ea1459ca6a4c6c213ac3fec2ec1c9c/vllm_ascend/core/scheduler_dynamic_batch.py) 在启用 `SLO_limits_for_dynamic_batch` 且 profile table 可用时，直接围绕：
 
 - `SLO limit`
 - `chunk_size`
 - decode-first chunked prefills
 
-工作。这说明 Ascend 在调度层额外引入了服务级时延约束，而不仅是 token budget。
+工作。这说明 Ascend 提供了一个以 SLO/profile table 为前提的动态 batch 扩展，在特定配置下把服务级时延约束引入调度层，而不仅是 token budget。
 
 ### 9.5 profiling chunk 把“测一遍再调度”做进了正式路径
 
@@ -341,12 +341,12 @@ Ascend runtime 会在 paged attention 与 fused infer attention 之间分流，�
 
 ### 11.2 `bind_threads()` 与 `bind_memory()` 说明 NUMA 也是正式性能模型的一部分
 
-`bind_threads()` 会：
+`bind_threads()` 会尝试：
 
 - 给主进程绑 `assign_main`
 - 给 ACL 线程绑 `assign_acl`
 - 给 release 线程绑 `assign_rel`
-- 最后通过 `migratepages` 把内存尽量迁到目标 NPU 的 NUMA node
+- 若系统工具与 NUMA 映射条件满足，再通过 `migratepages` 把内存尽量迁到目标 NPU 的 NUMA node
 
 这意味着在 Ascend 设备上，host 内存局部性不是“部署脚本层小优化”，而是 runtime 级因素。
 

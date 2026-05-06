@@ -333,11 +333,13 @@ flowchart TD
 
 `vllm_ascend/distributed/kv_transfer/__init__.py` 注册了多种 connector：
 
+- `MultiConnector`
 - Mooncake
 - AscendStore
 - UCM
 - LMCache
-- CPU offload
+
+`kv_pool/cpu_offload/` 下还单独实现了 CPU offload 子系统，但它不是在这里以独立 connector 名注册的。
 
 这说明 Ascend 侧对远端 KV、P/D 解耦、CPU pool 的依赖更深，KV transfer 不只是一个可选扩展，而是重要体系能力。
 
@@ -377,12 +379,7 @@ flowchart TD
 
 ## 11.4 `csrc/` 是完整 ACLNN/AscendC 体系
 
-从 `vllm-ascend/csrc/CMakeLists.txt` 可以看出，构建系统生成的不是 CUDA extension，而是：
-
-- `op_host_aclnn*`
-- `ops_aclnn`
-- 自定义 opapi/proto/tiling 库
-- Ascend custom OPP 打包产物
+从 `vllm-ascend/csrc/CMakeLists.txt` 可以看出，构建系统围绕 `op_host_aclnn*`、`opapi`、`opsproto`、`optiling` 以及 vendor package 安装规则组织 ACLNN / Ascend custom-op 产物，而不是 CUDA `.cu + torch binding` 的单一路径。
 
 这意味着 Ascend 内核开发的重心在：
 

@@ -17,7 +17,7 @@
 
 1. vLLM 的“continuous batching”本质不是一个单独模块，而是 `Scheduler` 以 `num_computed_tokens` 追赶 `num_tokens_with_spec` 的统一调度模型。
 2. PagedAttention 在系统层面的真正价值不是某一个 CUDA kernel，而是“逻辑块管理 + block table + slot mapping + backend-specific KV layout”构成的整套 KV 虚拟内存协议。
-3. `Scheduler`、`KVCacheManager`、`GPUModelRunner` 三层分工非常清晰：前者决定“哪些 token 该算”，中间层决定“KV 放到哪里”，后者负责“把逻辑调度翻译成设备输入并执行”。
+3. `Scheduler`、`KVCacheManager`、`Executor`、`GPUModelRunner` 四层分工非常清晰：前者决定“哪些 token 该算”，KV 层决定“KV 放到哪里”，`Executor` 负责跨 worker/进程编排，`GPUModelRunner` 负责“把逻辑调度翻译成设备输入并执行”。
 4. 在 v1 主线中，attention backend 已经从“单一 paged attention kernel”演进为“多后端可插拔执行系统”，FlashAttention、Triton、ROCm、自定义 kernel 都可能成为最终落点。
 5. prefix cache 命中的最小单位是“完整 block”，而且即使命中全部前缀，最后一个 token 仍可能需要重算以产出 logits；这决定了它不是语义级“完全跳过 prompt”。
 6. vLLM 的高吞吐来自三层摊销：调度摊销、元数据准备摊销、kernel/graph 执行摊销，而不是单点算子优化。
@@ -30,6 +30,7 @@
 | Engine Core 层 | `vllm/v1/engine/core.py` | 初始化 executor、profiling 可用显存、创建 KV 配置、主循环 `schedule -> execute -> update` | 不关心具体 attention backend 细节 |
 | 调度层 | `vllm/v1/core/sched/scheduler.py` | 运行队列/等待队列、token budget、preemption、spec decode、encoder budget、KV connector 协调 | 不直接分配底层张量 |
 | KV 管理层 | `vllm/v1/core/kv_cache_manager.py` `vllm/v1/core/block_pool.py` `vllm/v1/core/kv_cache_coordinator.py` | block 分配、prefix cache 命中、block 生命周期、逻辑 KV 组协调 | 不执行模型前向 |
+| Executor 层 | `vllm/v1/executor/*` | 把 `EngineCore` 的执行请求转成跨 worker/进程的 `collective_rpc`，分离 `execute_model` 与 `sample_tokens` 两阶段 | 不直接决定调度策略或 attention backend |
 | Worker/Runner 层 | `vllm/v1/worker/gpu_worker.py` `vllm/v1/worker/gpu/model_runner.py` | 将 `SchedulerOutput` 翻译为设备输入，准备 block table/slot mapping/attention metadata，执行模型 | 不决定高层调度策略 |
 | Attention Backend 层 | `vllm/v1/attention/*` `vllm/model_executor/layers/attention/attention.py` | 选择 backend，定义 KV 形状、stride、metadata builder、forward 逻辑 | 不管理请求级 block 生命周期 |
 | Native Ops 层 | `vllm/_custom_ops.py` `csrc/attention/*.cu` | C++/CUDA/Triton/ROCm 自定义 kernel | 不理解请求队列语义 |
@@ -44,15 +45,19 @@ flowchart TD
     D --> E[Scheduler.schedule]
     E --> F[KVCacheManager.allocate_slots / get_computed_blocks]
     F --> G[SchedulerOutput]
-    G --> H[GPUModelRunner.execute_model]
-    H --> I[prepare_inputs / prepare_attn]
-    I --> J[build_attn_metadata]
-    J --> K[Attention.forward]
-    K --> L[backend.do_kv_cache_update + backend.forward]
-    L --> M[FlashAttention / Triton / custom ops / paged kernels]
-    M --> N[GPUModelRunner.sample_tokens]
-    N --> O[Scheduler.update_from_output]
-    O --> P[EngineCoreOutput -> OutputProcessor]
+    G --> H[Executor.execute_model]
+    H --> I[GPUModelRunner.execute_model]
+    I --> J[prepare_inputs / prepare_attn]
+    J --> K[build_attn_metadata]
+    K --> L[Attention.forward]
+    L --> M[backend.do_kv_cache_update + backend.forward]
+    M --> N[FlashAttention / Triton / custom ops / paged kernels]
+    G --> O[Scheduler.get_grammar_bitmask]
+    N --> P[Executor.sample_tokens if needed]
+    O --> P
+    P --> Q[GPUModelRunner.sample_tokens]
+    Q --> R[Scheduler.update_from_output]
+    R --> S[EngineCoreOutput -> OutputProcessor]
 ```
 
 ### 4.1 入口与引擎主循环
@@ -62,8 +67,10 @@ flowchart TD
 - `LLMEngine` 并不直接调度模型，而是通过 `EngineCoreClient.make_client()` 连接 `EngineCore`。
 - 真正的内循环在 `vllm/v1/engine/core.py::EngineCore.step()`：
   1. `scheduler.schedule()`
-  2. `model_executor.execute_model(...)`
-  3. `scheduler.update_from_output(...)`
+  2. `model_executor.execute_model(..., non_block=True)`
+  3. `scheduler.get_grammar_bitmask(...)`
+  4. 等待 `future.result()`；若 worker 仅完成前向则再走 `model_executor.sample_tokens(...)`
+  5. `scheduler.update_from_output(...)`
 
 ### 4.2 初始化阶段
 
@@ -85,7 +92,7 @@ flowchart TD
 | `Request` | `vllm/v1/request.py` | Scheduler | 请求级状态机，记录 prompt/output/spec tokens、`num_computed_tokens`、`num_output_placeholders`、block hashes |
 | `SchedulerOutput` | `vllm/v1/core/sched/output.py` | Scheduler | 一轮调度的设备侧执行描述，包括每个 request 计划计算的 token 数、block 变更、spec decode 元数据等 |
 | `KVCacheConfig` | `vllm/v1/kv_cache_interface.py` | EngineCore / Worker | 描述 KV tensor、group、block size、layout 需求 |
-| `KVCacheBlocks` | `vllm/v1/core/kv_cache_manager.py` | KVCacheManager | Scheduler 与 KV 管理层之间的抽象接口，隐藏内部 block 结构 |
+| `KVCacheBlocks` | `vllm/v1/core/kv_cache_utils.py` | KVCacheManager | Scheduler 与 KV 管理层之间的抽象接口，隐藏内部 block 结构 |
 | `InputBatch` | `vllm/v1/worker/gpu/input_batch.py` | GPUModelRunner | 一轮 batch 的扁平化设备输入描述，包括 `query_start_loc`、`seq_lens`、`input_ids`、`positions` |
 | `CommonAttentionMetadata` | `vllm/v1/attention/backend.py` | Attention metadata builder | backend 无关的 attention 输入协议 |
 | `slot_mapping` | `vllm/v1/worker/gpu/block_table.py` | Worker | 逻辑 token 位置到物理 KV 槽位的映射 |
@@ -136,7 +143,7 @@ flowchart TD
 
 ### 不变量 5：PagedAttention 是“系统协议”，不是“单 kernel 名称”
 
-`vllm/v1/attention/ops/paged_attn.py::PagedAttention` 只提供 `split_kv_cache()` 和 `write_to_paged_cache()` 这样的工具函数。
+`vllm/v1/attention/ops/paged_attn.py::PagedAttention` 在 v1 中主要暴露 `split_kv_cache()` 和 `write_to_paged_cache()` 这类 page 化 KV 操作入口。
 真正的 decode/prefill 执行路径可能落到：
 
 - `FlashAttention`
@@ -299,7 +306,7 @@ Worker 侧 `vllm/v1/worker/gpu/block_table.py` 做两件事：
 4. `prepare_attn(...)`
 5. 构建 `attn_metadata`
 6. 决定走 CUDA graph replay 还是 eager/model forward
-7. `sample_tokens(...)`
+7. 返回 hidden states / `IntermediateTensors` 或缓存本轮执行状态，采样在独立的 `sample_tokens(...)` 阶段完成
 
 它本质上是“把请求级状态机翻译为单轮设备执行描述”。
 
@@ -322,7 +329,7 @@ Worker 侧 `vllm/v1/worker/gpu/block_table.py` 做两件事：
 - `prepare_prefill_inputs(...)` 用 Triton kernel 从 request state 中抽取 prompt token
 - `prepare_pos_seq_lens(...)` 计算 `positions` 和 `seq_lens`
 
-这两步都是为了避免 Python 逐 token 处理带来的 CPU 开销。
+这两步都是为了避免 Python 逐 token 打包，并把批量元数据准备下沉到 Triton/device 侧。
 
 ## 9.3 attention metadata builder 是后端桥梁
 
