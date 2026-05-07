@@ -60,15 +60,15 @@ flowchart TD
     R --> S[EngineCoreOutput -> OutputProcessor]
 ```
 
-举例子：
-vLLM 调度侧在 GPUModelRunner.execute_model() 里调用 self.model(**model_inputs)，模型内部的 Transformer
-layers 在具体模型的 forward() 里循环执行。  
 
-在 vLLM v1 里，Transformer 前向是在 GPUModelRunner.execute_model() 里触发的，关键调用是：
-vLLM/vllm-upstream/vllm/v1/worker/gpu/model_runner.py:1118
-model_output = self.model(**model_inputs)
+**大模型核心前向推理代码执行：**  
+
+在 vLLM v1 里，Transformer 前向是在 `GPUModelRunner.execute_model()` 里触发的，关键调用是：
+`vLLM/vllm-upstream/vllm/v1/worker/gpu/model_runner.py:1118`
+`model_output = self.model(**model_inputs)`
 
 这行会进入具体模型类的 forward()。以 Qwen3 为例，调用链大致是：
+```
 EngineCore.step()
  -> Executor.execute_model()
  -> GPUWorker.execute_model()
@@ -77,16 +77,17 @@ EngineCore.step()
  -> Qwen3ForCausalLM.forward()
  -> Qwen3Model / Qwen2Model.forward()
  -> for layer in self.layers: layer(...)
+```
 
 真正逐层执行 Transformer block 的循环在 Qwen2/Qwen3 共享的模型主体里：
-vLLM/vllm-upstream/vllm/model_executor/models/qwen2.py:408
-for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
-    hidden_states, residual = layer(positions, hidden_states, residual)
+`vLLM/vllm-upstream/vllm/model_executor/models/qwen2.py:408`
+`for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):`
+    `hidden_states, residual = layer(positions, hidden_states, residual)`
 
-每个 layer(...) 执行一个 decoder layer，里面再执行 attention 和 MLP。以 Qwen3 的 decoder layer 为例：
-vLLM/vllm-upstream/vllm/model_executor/models/qwen3.py:216
-hidden_states = self.self_attn(...)
-hidden_states = self.mlp(hidden_states)
+每个 `layer(...)` 执行一个 decoder layer，里面再执行 attention 和 MLP。以 Qwen3 的 decoder layer 为例：
+`vLLM/vllm-upstream/vllm/model_executor/models/qwen3.py:216`
+`hidden_states = self.self_attn(...)`
+`hidden_states = self.mlp(hidden_states)`
 
 
 
@@ -549,3 +550,84 @@ mini-vllm 把这条边界画得更直白，可以当对照：
 - 真正"贵"的是模型本身的非标准算子：MLA、Indexer、特殊 RoPE、复杂 MoE 路由、新型 KV state——这些既是论文创新点，也是适配的工程量来源。如果一个新模型只是把 Llama 加宽加深、换 RoPE base，那 200 行就够了；如果它发明了一种新 attention，那它需要在 `layers/` 里加新基础设施，这一步通常不是"用户做模型适配"的范畴，而是 vLLM core 接收新机制的过程。
 
 一句话：vLLM 给 Transformer 划了一道"Lego 接口"，模型作者只搭 Lego，引擎部分不动——除非这个模型自带新形状的积木。
+
+## 15. 开源模型发布的时候，到底开的是什么
+
+以 DeepSeek 这类典型的大模型为例，一次 "开源发布" 通常包含以下几样东西，按"对推理引擎适配工作的影响力"排序。
+
+### 15.1 一次标准发布里的清单
+
+放在 HuggingFace Hub 上的一个 repo（例如 `deepseek-ai/DeepSeek-V3`）里：
+
+| 文件 | 作用 | 对 vLLM 适配的影响 |
+|---|---|---|
+| `*.safetensors` / `*.bin` | 模型权重（几十 GB 到上 TB） | 最重要。vLLM 的 `load_weights` 需要读这个 |
+| `config.json` | 架构超参（hidden_size、num_layers、num_heads、num_kv_heads、rope_theta、moe 配置、量化配置等） | 适配入口。模型类要根据它构造 |
+| `tokenizer.json` / `tokenizer_config.json` / `special_tokens_map.json` | 分词器 | vLLM 直接用 HF tokenizer，不用改 |
+| `generation_config.json` | 默认采样参数（temperature、top_p、eos 等） | 可选 |
+| `modeling_deepseek.py`（通常随 repo 附带，带 `trust_remote_code=True`） | HF 风格的 PyTorch 参考实现（`nn.Linear` + `F.scaled_dot_product_attention`，几百行到一两千行） | 这是适配 vLLM 的主要翻译源 |
+| `configuration_deepseek.py` | HF Config 子类 | vLLM 的 config 适配层要对应 |
+| `README.md` / `MODEL_CARD.md` | 用法、benchmark、license | 辅助 |
+| 论文（arXiv） | 算法细节、设计动机、超参选择理由 | 当参考实现和论文对不上或参考实现"看起来不够优化"时，回来查 |
+
+所以答案很直接：**绝大多数情况下，开源方会同时放出一份 PyTorch 的 reference implementation（`modeling_xxx.py`），不需要从论文凭空复现。**
+
+这份 reference 通常用 `transformers` 的风格写：继承 `PreTrainedModel`、用标准 `nn.Linear`、用 `scaled_dot_product_attention` 或手写 attention、没有 PagedAttention、没有 TP、不管 KV cache 分页、不管 continuous batching。它能跑，但慢、不支持并发、不支持大 batch。
+
+### 15.2 DeepSeek V3/V4 的实际情况（代表性案例）
+
+DeepSeek 团队的发布模式算业界相对慷慨的：
+
+- **权重** — 放在 HF Hub 上，分 Base 和 Chat/Instruct。
+- **`modeling_deepseek.py`** — 附带；里面就有 MLA、MoE router、Yarn RoPE 这些新算子的 PyTorch 实现。每一块你都能对着读。
+- **论文/技术报告** — `DeepSeek-V3 Technical Report`、`DeepSeekMoE`、`DeepSeek-V2` 的 MLA 章节。主要用来理解 *为什么* 这么设计，不是用来"复现"。
+- **推理示例** — 官方给一个 `inference/` 目录，用 torch + 少量 kernel 跑单机/多机 demo，有的版本还附带 FP8 权重和简单的 FP8 forward 示例。
+- **vLLM / SGLang 侧的适配 PR** — 通常在发布前几周 DeepSeek 就跟 vLLM 团队对接好了，所以看到 "day-0 support" 的新闻时，`model_executor/models/deepseek_v4.py` 往往是跟权重同一天甚至提前 merge 进 vLLM main 分支的。
+
+换言之：**DeepSeek V4 的 `deepseek_v4.py` 不是社区拿着论文逆向出来的**，大概率是：
+
+1. DeepSeek 给 vLLM 团队 / 可信合作方 early access（权重 + HF reference + 未公开的技术细节）。
+2. vLLM 团队（或 DeepSeek 内部贡献者）基于 HF reference 翻译成 vLLM 风格。
+3. MLA / Indexer 这些 vLLM 里原本没有的组件，要在 `model_executor/layers/` 新增（`deepseek_v4_attention.py` 就是这样加进去的）。
+4. 发布当天权重 + vLLM 支持同时出现。
+
+### 15.3 "一套完整能跑的代码" 的四个层次
+
+可以把"能跑"分成四档：
+
+| 档次 | 代表产物 | 性能 | 用途 |
+|---|---|---|---|
+| A. HF reference (`modeling_xxx.py` + `trust_remote_code=True`) | 官方随权重发布 | 慢、单请求、无 KV 分页 | 验证权重正确性、做学术实验、给下游引擎做翻译源 |
+| B. 官方 inference 仓库 | `deepseek-ai/DeepSeek-V3` 里的 `inference/` | 比 HF 稍快，可能带 FP8 demo | demo、验证数值、给其他团队抄 FP8 实现 |
+| C. 生产推理引擎适配 (vLLM / SGLang / TensorRT-LLM) | 发布当天或发布后几天到几周 | 真正生产级：PagedAttention、TP、continuous batching、量化 | 部署服务 |
+| D. 深度优化（算子融合、特化 kernel、MLA KV cache 特殊布局） | 发布后持续数周到数月 | 相比 C 档再快 1.5–3× | 顶级推理性能 |
+
+A 档几乎总是和权重一起开源。B、C、D 依赖模型团队的合作意愿——DeepSeek 算开得比较齐全的，Meta / Mistral 也不错；另一些团队只给 A 档，C 档完全靠社区补。
+
+### 15.4 vLLM 社区到底做了多少"从零写"
+
+结合前面 DeepSeek V4 的例子，工作量分三块：
+
+- **翻译**（占大头）
+  把 HF reference 里的 `nn.Linear(hidden, 3*hidden)` 替换成 `QKVParallelLinear`、把 `F.scaled_dot_product_attention(...)` 替换成 `Attention(...)`、把 `nn.Embedding` 替换成 `VocabParallelEmbedding`、把 MLP 合并成 `MergedColumnParallelLinear`。这部分机械但要对并行维度特别小心。HF reference 读明白后，80% 的翻译可以照抄结构。
+
+- **新算子搬运**（中等）
+  HF reference 里的 MLA / Indexer / 特殊 router 通常写得"能跑就行"。vLLM 适配时要决定：
+  - 保持 naive 实现（先 day-0 支持再说）
+  - 还是直接上 Triton/CUDA 特化 kernel（性能好但开发周期长）
+
+  DeepSeek V2 刚出来时 MLA 在 vLLM 里是 naive 版本，后来才陆续有了专门的 MLA kernel。这就是"先 merge 再优化"的常见节奏。
+
+- **权重 key 映射**（琐碎但必要）
+  HF 里叫 `model.layers.0.self_attn.q_proj.weight`，vLLM 里合并成了 `qkv_proj`；HF 里 MoE 的 expert 可能是 `experts.0.w1.weight`、`experts.0.w2.weight`、`experts.0.w3.weight`，vLLM 的 `FusedMoE` 要 stack 成一个 3D tensor。`AutoWeightsLoader` + `WeightsMapper` 在 model 文件里写的那张映射表就是干这个的。
+
+真正"凭论文从零复现"的情况几乎不存在，除非模型发布方完全不给 reference implementation（罕见），或者 reference 有严重 bug / 被证明和权重对不上（发生过，但少）。社区即便想独立实现，也会等 HF reference 出来以后以它为 ground truth 对数值。
+
+### 15.5 小结
+
+- **开源发布的"最小集合"**：权重 + config + tokenizer + HF 风格 `modeling_xxx.py` + 论文。DeepSeek 额外再给 `inference/` demo 和 FP8 示例。
+- **"能跑的代码" 几乎总是有**，就是 HF reference；但它不能拿来做生产推理，因为没有 PagedAttention / TP / continuous batching。
+- **vLLM 适配**本质是把 HF reference 翻译成 vLLM 风格，不是凭论文复现。主要工作在：并行原语替换、新算子搬运（+ 可选的 kernel 优化）、权重命名映射。
+- **day-0 support** 之所以可能，是因为模型厂商提前跟 vLLM 团队对接。非合作关系的模型，通常延迟 1–4 周才能在 vLLM 里跑起来，再过一段时间才会有深度优化。
+
+换句话说：vLLM 里的 `deepseek_v4.py` 更像是一份"工业级移植版"——原始蓝图是 DeepSeek 的 HF reference，移植工作是把它嵌进 vLLM 的性能/并行框架里。论文是背景材料，不是实现依据。
