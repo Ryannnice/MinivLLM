@@ -104,6 +104,7 @@ class ReplicatedLinear(LinearBase): # 继承 LinearBase 父类
 
 
 # 定义[列并行]线性层：沿输出维度切分。
+# 按照列维度分开。 某个GPU计算完后，结果的 *某个维度* 是 *最终结果*，但是某GPU只有这些局部维度的信息。所以最后通过通讯来收集别的GPU结果
 class ColumnParallelLinear(LinearBase):
     # 定义初始化函数。
     def __init__(
@@ -115,11 +116,11 @@ class ColumnParallelLinear(LinearBase):
         # 获取当前张量并行组的总卡数。
         tp_size = dist.get_world_size()
 
-        # 列并行要求输出维度能被卡数整除。
+        # 列并行要求[输出维度]能被卡数整除。
         assert output_size % tp_size == 0, "Output size must be divisible by tensor parallel size."
 
         # 传给基类的输出维度是“当前 rank 持有的那一片输出维度”。
-        super().__init__(input_size, output_size // tp_size, bias, tp_dim=0)
+        super().__init__(input_size, output_size // tp_size, bias, tp_dim=0) # // : 取商，不保留余数  
 
     # 定义[列并行]的权重加载逻辑。
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
@@ -129,7 +130,7 @@ class ColumnParallelLinear(LinearBase):
         full_data_output_size = loaded_weights.size(0)
 
         # 计算每个 rank 理论应拿到多少输出行。
-        shard_size = full_data_output_size // self.tp_size
+        shard_size = full_data_output_size // self.tp_size # 除以总卡数  
         # 断言切分后大小与本地参数形状一致。
         assert shard_size == param_data.size(0), "Shard size does not match parameter size."
         
@@ -143,10 +144,12 @@ class ColumnParallelLinear(LinearBase):
     # 定义前向传播逻辑。
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 当前 rank 只会计算自己负责的那部分输出特征。
+        # 按照列维度分开。 某个GPU计算完后，结果的 *某个维度* 是 *最终结果*，但是某GPU只有这些局部维度的信息。所以最后通过通讯来收集别的GPU结果
         return nn.functional.linear(x, self.weight, self.bias)
 
 
 # 定义一个“合并多个列并行矩阵”的线性层。
+# 继承自 ColumnParallelLinear，所以还是按第 0 维，也就是输出维切分。
 class MergedColumnParallelLinear(ColumnParallelLinear):
     # 定义初始化函数，`output_sizes` 表示被合并的各个输出矩阵大小。
     def __init__(
@@ -160,24 +163,26 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         # 调用父类初始化，把多个输出维求和后当成一个大矩阵处理。
         super().__init__(input_size, sum(output_sizes), bias)
 
-    # 定义合并列并行层的权重加载逻辑。
+    # 定义合并列并行层的权重加载逻辑。  
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor, loaded_weight_id: int):
-        # 取出目标参数数据。
-        param_data = param.data
-        # 计算当前要装载的是第几个子矩阵在本地大矩阵中的偏移位置。
-        offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
-        
-        # 计算当前子矩阵在本 rank 上对应的分片大小。
-        shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
-        # 在大矩阵参数里先 narrow 到当前子矩阵对应的那一段。
-        param_data = param_data.narrow(0, offset, shard_size)
-        # 计算完整权重在本 rank 上应切出的起始位置。
-        loaded_weights_start_index = self.tp_rank * shard_size
-        # 从完整子矩阵里切出当前 rank 负责的输出分片。
-        shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)
-        # 将分片权重写入本地参数的对应区间。
-        param_data.copy_(shard_weights)
-
+        # 取出目标参数数据  
+        param_data = param.data  
+        # 计算当前要装载的是第几个子矩阵在本地大矩阵中的偏移位置  
+        # sum(self.output_sizes[:loaded_weight_id]) 把当前子矩阵之前的所有输出维度加起来  
+        offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size  
+          
+        # 计算当前子矩阵在本 rank 上对应的分片大小。  
+        shard_size = self.output_sizes[loaded_weight_id] // self.tp_size  
+        # 在大矩阵参数里先 narrow 到当前子矩阵对应的那一段。  
+        # 沿第 0 维，从 offset 开始，取 shard_size 长度  
+        param_data = param_data.narrow(0, offset, shard_size)  
+        # 计算完整权重在本 rank 上应切出的起始位置。  
+        loaded_weights_start_index = self.tp_rank * shard_size  
+        # 从完整子矩阵里切出当前 rank 负责的输出分片。  
+        shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)  
+        # 将分片权重写入本地参数的对应区间。  
+        param_data.copy_(shard_weights)  
+  
 
 # 定义专门为 attention QKV 投影服务的列并行线性层。
 class QKVColumnParallelLinear(ColumnParallelLinear):
@@ -248,6 +253,7 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
 
 
 # 定义行并行线性层：沿输入维度切分。
+# 按照行维度分开。 某个GPU计算完后，有*每个*维度的信息，但是完整的维度上，都不是最终结果。所以最后*每个维度都*要再与来自其他GPU的中间信息进行计算，得到最终结果  
 class RowParallelLinear(LinearBase):
     # 定义初始化函数。
     def __init__(
@@ -307,3 +313,4 @@ if __name__ == "__main__":
     layer = LinearBase(input_size=10, output_size=5)
     # 打印创建结果。
     print("LinearBase layer initialized:", layer)
+    print(layer)
