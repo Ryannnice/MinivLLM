@@ -1,10 +1,10 @@
 # 文件内容概览：
-# 1. 定义项目里所有[并行线性层]的基础类与具体实现。
+# 1. 定义项目里所有[并行][线性层]的基础类与具体实现。
 # 2. 包括 普通复制线性层、列并行线性层、行并行线性层、合并列并行层和专用的 QKV 列并行层。
 # 3. 同时实现了“如何从完整 checkpoint 权重切出当前 rank 分片”的权重加载逻辑。
-#
+# 
 # 在项目中的作用：
-# 1. 这是模型做张量并行的核心基础设施。
+# 1. 这是模型做[张量并行]的核心基础设施。
 # 2. attention 的 QKV 投影、MLP 的 gate/up/down 投影、输出投影都建立在这些类上。
 # 3. 它负责把“完整模型权重”映射成“当前 GPU 只保留自己负责的那一片参数”。
 
@@ -37,7 +37,7 @@ class LinearBase(nn.Module):
         super().__init__()
         # 保存张量并行切分发生在哪个维度上。
         self.tp_dim = tp_dim
-        # 获取当前进程在张量并行组中的 rank。
+        # 获取当前进程在张量并行组中的编号 (rank)。
         self.tp_rank = dist.get_rank()
         # 获取当前张量并行组中的总卡数。
         self.tp_size = dist.get_world_size()
@@ -80,7 +80,7 @@ class LinearBase(nn.Module):
 
 
 # 定义最简单的[复制式]线性层，不做张量并行切分
-class ReplicatedLinear(LinearBase):
+class ReplicatedLinear(LinearBase): # 继承 LinearBase 父类 
     # 定义初始化函数。
     def __init__(
         self,
@@ -95,6 +95,7 @@ class ReplicatedLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         # 复制式线性层不做切分，直接完整拷贝权重即可。
         param.data.copy_(loaded_weights)
+        # 把 loaded_weights 的值复制到 param 里面，直接修改 param 本身，不创建新的 Tensor。
 
     # 定义前向传播逻辑。
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`mini-vllm/` is the active codebase. Core package code lives in `mini-vllm/src/myvllm/`: use `engine/` for scheduling and KV-cache flow, `layers/` for attention and layer primitives, `models/` for model definitions, and `utils/` for shared helpers. Runnable demos and benchmarks sit beside the package in `mini-vllm/main.py`, `main_llama32.py`, `benchmark_prefilling.py`, `benchmark_decoding.py`, and `benchmark_tps.py`. Tests live in `mini-vllm/tests/`. Top-level `docs/` contains study notes. `vLLM/vllm-upstream/` and `vLLM/vllm-ascend/` are reference/vendor trees; avoid incidental edits unless the task explicitly targets them.
+`mini-vllm/` is the active codebase. Core package code lives in `mini-vllm/src/myvllm/`: use `engine/` for scheduling and KV-cache flow, `layers/` for attention and layer primitives, `models/` for model definitions, and `utils/` for shared helpers. Runnable demos and benchmarks sit beside the package in `mini-vllm/main.py`, `main_llama32.py`, `benchmark_prefilling.py`, `benchmark_decoding.py`, and `benchmark_tps.py`. Tests live in `mini-vllm/tests/`. Top-level `docs/` contains study notes. `vLLM/vllm-upstream/`, `vLLM/vllm-ascend/`, and `xllm/` are reference/vendor trees; avoid incidental edits unless the task explicitly targets them.
 
 ## Build, Test, and Development Commands
 
@@ -26,7 +26,7 @@ Use `pytest`. Place new tests under `mini-vllm/tests/` as `test_<feature>.py`, w
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses short, scoped subjects such as `fix/修正文档`, `progress/layers`, `更新文档`, and `refactor/调整为学习版的文件结构`. Keep commit titles concise and imperative; optional prefixes like `fix/`, `docs/`, `refactor/`, or `progress/` match the existing pattern. Pull requests should state the motivation, list touched paths, include exact verification commands, and attach benchmark results for performance-sensitive changes.
+Recent history uses short, scoped subjects such as `fix/修正文档`, `refactor/调整为学习版的文件结构`, `更新文档`, and `完整文档`. Keep commit titles concise and imperative; optional prefixes like `fix/`, `docs/`, `refactor/`, or `progress/` match the existing pattern. Pull requests should state the motivation, list touched paths, include exact verification commands, and attach benchmark results for performance-sensitive changes.
 
 ## Configuration Tips
 
