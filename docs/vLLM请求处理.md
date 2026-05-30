@@ -1,32 +1,10 @@
-# vLLM 请求处理
+# vLLM 多请求调度处理
 
-> 以 `vLLM/vllm-upstream` 的 v1 实现为准。本文主线走 `AsyncLLM`，因为它最能体现“多个用户同时发请求”时的真实行为。同步版 `LLMEngine` 走的是同一套调度与 worker 逻辑，只是输出回收方式不同。
+> 分析对象：`vLLM/vllm-upstream` 的 v1 推理链路。本文用一个高并发例子贯穿 `AsyncLLM -> EngineCore -> Scheduler -> GPUModelRunner -> OutputProcessor`，重点解释多个用户请求如何被混成 batch，又如何准确返回给各自用户。
 
-## 先看全链路
+## 0. 先记住三个配置
 
-```text
-用户请求
-  -> AsyncLLM.generate()
-  -> AsyncLLM.add_request()
-  -> OutputProcessor.add_request()
-  -> EngineCore.add_request_async()
-  -> Scheduler.add_request()
-  -> waiting / skipped_waiting
-  -> Scheduler.schedule()
-  -> SchedulerOutput
-  -> EngineCore.step()
-  -> GPUModelRunner.execute_model()
-  -> GPUModelRunner.sample_tokens()
-  -> Scheduler.update_from_output()
-  -> OutputProcessor.process_outputs()
-  -> RequestOutputCollector / API 返回
-```
-
-vLLM 的关键不是“每个请求单独跑完再处理下一个”，而是把所有请求放进统一的请求池里，每一轮只看“谁还能再推进多少 token”。所以从调度器视角看，不存在严格的 prefill / decode 两个大阶段，只有 `num_computed_tokens` 跟 `num_tokens_with_spec` 的追赶关系。
-
-## 一组具体例子
-
-下面用一个简化配置说明高并发请求如何被混排：
+本文使用一个教学用简化配置：
 
 ```text
 max_num_seqs = 4
@@ -34,151 +12,357 @@ max_num_batched_tokens = 8
 scheduling policy = FCFS
 ```
 
+| 配置 | 管什么 | 在例子中的含义 |
+|---|---|---|
+| `max_num_seqs` | 同时处于运行态的请求数 | 最多 4 个请求一起占用调度槽 |
+| `max_num_batched_tokens` | 一轮调度中实际要推进的 token 总数 | 通常等于这一轮 prefill token + decode token 的总预算；源码里实际使用的是 `max_num_scheduled_tokens`，默认等于它 |
+| `max_tokens` | 单个请求最多生成的输出 token 数 | 由用户或 API 参数传入，不包含 prompt token |
+
+注意：`max_num_batched_tokens` 不是只算输入，也不是只算输出，而是**本轮实际送进模型计算的总 token 预算**。如果源码显式设置了 `max_num_scheduled_tokens`，调度器会优先用它。
+
+## 1. 贯穿全文的并发请求例子
+
 同时来了 4 个用户请求：
 
-| 请求 | 到达时间 | prompt tokens | max_tokens | 说明 |
+| 请求 | 到达时间 | prompt tokens | `max_tokens` | 说明 |
 |---|---:|---:|---:|---|
 | A | T0 | 3 | 5 | 先到 |
 | B | T0 | 2 | 4 | 先到 |
 | C | T0 | 3 | 2 | 先到 |
 | D | T1 | 6 | 3 | 后到 |
 
-这个例子故意把 token 数做成容易看清的数字。真实线上请求当然会更长、更乱，但调度原则一样。
+可以把它理解成：
 
-## 第 1 步：用户请求进入 AsyncLLM
-
-调用入口通常是：
-
-```python
-AsyncLLM.generate(...)
+```text
+A: 输入 3 个 token，最多再生成 5 个 token
+B: 输入 2 个 token，最多再生成 4 个 token
+C: 输入 3 个 token，最多再生成 2 个 token
+D: 输入 6 个 token，最多再生成 3 个 token
 ```
 
-内部先走：
+`max_tokens` 是请求侧参数，例如 OpenAI 风格请求里的 `max_tokens` 或 vLLM 内部的 `SamplingParams(max_tokens=...)`。
+
+## 2. 全链路总览
+
+一条请求进入 vLLM 后，会经过这条链：
+
+```text
+用户请求
+  -> AsyncLLM.generate()
+  -> AsyncLLM.add_request()
+  -> InputProcessor.process_inputs()
+  -> OutputProcessor.add_request()
+  -> EngineCore.add_request_async()
+  -> Scheduler.add_request()
+  -> Scheduler.schedule()
+  -> EngineCore.step()
+  -> GPUModelRunner.execute_model()
+  -> GPUModelRunner.sample_tokens()
+  -> Scheduler.update_from_output()
+  -> OutputProcessor.process_outputs()
+  -> RequestOutputCollector
+  -> 用户收到流式输出
+```
+
+分层看更清楚：
+
+| 层 | 主要函数 | 负责什么 |
+|---|---|---|
+| API 层 | `AsyncLLM.generate()` | 接收用户请求，返回异步生成流 |
+| 输入处理 | `InputProcessor.process_inputs()` | tokenize，生成 `EngineCoreRequest` |
+| 输出处理 | `OutputProcessor.add_request()` | 在输出处理器里登记请求，并绑定请求队列 |
+| 引擎核心 | `EngineCore.step()` | 串起 schedule、execute、sample、update |
+| 调度器 | `Scheduler.schedule()` | 决定本轮跑哪些请求、多少 token |
+| Worker | `GPUModelRunner.execute_model()` | 把请求 batch 转成 GPU tensor 并前向 |
+| 采样 | `GPUModelRunner.sample_tokens()` | 从 logits 采样出新 token |
+| 回写 | `Scheduler.update_from_output()` | 把新 token 写回对应 request |
+
+AsyncLLM 是 vLLM 的异步请求入口。
+
+你可以把它理解成：
+用户发请求
+ -> AsyncLLM 接收
+ -> 后台引擎跑
+ -> 结果异步流式返回
+
+它的核心作用有三件：
+1. 接收请求
+    - 处理 generate() / add_request()
+    - 把用户输入转成内部 EngineCoreRequest
+2. 启动后台输出循环
+    - _run_output_handler()
+    - 持续从 EngineCore 拉结果
+3. 把结果分发回每个请求
+      - 每个请求有自己的 RequestOutputCollector
+      - 所以多个用户同时请求时，不会串结果
+
+## 3. Step 1：请求进入 AsyncLLM
+
+用户 A/B/C 在 T0 同时进入：
+
+```text
+A -> AsyncLLM.generate(request_id="A", prompt=..., SamplingParams(max_tokens=5))
+B -> AsyncLLM.generate(request_id="B", prompt=..., SamplingParams(max_tokens=4))
+C -> AsyncLLM.generate(request_id="C", prompt=..., SamplingParams(max_tokens=2))
+```
+
+每个请求都会走：
 
 ```python
 AsyncLLM.add_request(...)
+InputProcessor.process_inputs(...)
+OutputProcessor.add_request(...)
+engine_core.add_request_async(...)
 ```
 
-这一步做了几件事：
-
-1. `InputProcessor.process_inputs(...)`
-   - 把 prompt / chat / multimodal 输入标准化成 `EngineCoreRequest`
-   - 完成 tokenization、参数归一化、`request_id` 绑定
-2. `OutputProcessor.add_request(...)`
-   - 在 API 侧创建 `RequestState`
-   - 为每个请求准备一个 `RequestOutputCollector`
-3. `engine_core.add_request_async(...)`
-   - 把请求送到后台的 `EngineCore`
-
-所以多个用户同时请求时，API 侧并不是直接进模型，而是每个请求先拥有自己的状态容器：
+这一阶段最重要的结果是两个：
 
 ```text
-用户 A -> RequestOutputCollector(A)
-用户 B -> RequestOutputCollector(B)
-用户 C -> RequestOutputCollector(C)
+EngineCoreRequest:
+  request_id
+  prompt_token_ids
+  sampling_params.max_tokens
+  arrival_time
+  priority
+
+RequestOutputCollector:
+  每个请求一个独立输出队列
 ```
 
-这样后面就算 batch 混在一起，返回结果也不会串。
+所以即使后面 A/B/C/D 被混在一个 batch 里执行，API 侧仍然知道：
 
-## 第 2 步：EngineCore 把请求放进 waiting
+```text
+A 的输出放回 A 的队列
+B 的输出放回 B 的队列
+C 的输出放回 C 的队列
+```
 
-`EngineCore.add_request(...)` 最终会调用：
+## 4. Step 2：Scheduler 接收请求，但不立刻执行
+
+`EngineCore` 收到请求后，会调用：
 
 ```python
 Scheduler.add_request(request)
 ```
 
-Scheduler 里不是立刻执行，而是把请求放到队列中：
+调度器内部维护两个主要等待队列：
 
-- `waiting`：普通待调度请求
-- `skipped_waiting`：被结构化输出、远端 KV、流式输入等条件暂时卡住的请求
+| 队列 | 放什么 |
+|---|---|
+| `waiting` | 普通待调度请求 |
+| `skipped_waiting` | 暂时不能调度的请求，例如等待结构化输出 grammar、远端 KV、流式输入 |
 
-对应逻辑在：
+T0 时 A/B/C 进入后：
 
-- `Scheduler.add_request(...)`
-- `Scheduler._enqueue_waiting_request(...)`
-- `Scheduler._select_waiting_queue_for_scheduling(...)`
+```text
+waiting = [A, B, C]
+running = []
+```
 
-如果调度策略是 `FCFS`，就先来先服务；如果是 `PRIORITY`, 就按优先级和到达时间排序。这里的队列本质上只是“候选池”，真正执行要等 `schedule()`。
+这里还没有模型执行，只是把请求放进调度器的候选池。
 
-## 第 3 步：Scheduler.schedule() 组成这一轮 batch
+## 5. Step 3：第一轮 schedule，把 A/B/C 拼成 batch
 
-这是整条链路里最关键的一步。
+调度入口：
 
 ```python
 Scheduler.schedule()
 ```
 
-它做的事情可以概括成：
-
-1. 先处理 `running` 里的老请求
-2. 再用剩余 token budget 填充 `waiting`
-3. 如果 KV cache 不够，可能 preempt 低优先级请求
-4. 产出一份 `SchedulerOutput`
-
-### 3.1 先跑 running
-
-`running` 里存的是已经占着 KV cache 的请求。调度器每一轮先看这些老请求还能推进多少 token。
-
-在我们的例子里，T0 时 A/B/C 同时进入 `running`。第一轮 batch 可以直接把三条请求一起塞进去：
+vLLM v1 的调度器不是按固定的 prefill 阶段、decode 阶段切开，而是看每个请求：
 
 ```text
-batch 1 = A(3) + B(2) + C(3) = 8 tokens
+还差多少 token 没算？
 ```
 
-因为总和刚好等于 `max_num_batched_tokens`，所以这一轮不会再接纳新的 waiting 请求。
+内部核心状态可以理解为：
 
-### 3.2 再跑 waiting
+```text
+num_computed_tokens      已经算过多少 token
+num_tokens_with_spec     当前请求总共希望模型追到哪里
+num_new_tokens           本轮还能推进多少 token
+```
 
-到 T1 时，D 到达。A/B/C 已经在 `running` 里了，D 先进入 `waiting`。
+### 5.1 T0 的调度结果
 
-下一轮调度时，先给 A/B/C 各推进 1 个输出 token：
+A/B/C 都是新请求，prompt 还没算：
+
+| 请求 | 本轮要算 | token 数 |
+|---|---|---:|
+| A | prompt prefill | 3 |
+| B | prompt prefill | 2 |
+| C | prompt prefill | 3 |
+
+合计：
+
+```text
+3 + 2 + 3 = 8
+```
+
+刚好等于 `max_num_batched_tokens = 8`，所以第一轮 batch 是：
+
+```text
+batch 1 = A(3) + B(2) + C(3)
+```
+
+调度后状态：
+
+```text
+waiting = []
+running = [A, B, C]
+```
+
+这一轮虽然调度的是 prompt prefill token，但生成模型通常会在 prefill 前向结束后，用每个请求最后一个 prompt 位置的 logits 采样出首个输出 token。也就是说，`max_num_batched_tokens` 统计的是本轮送入模型计算的 token，不等于本轮最终返回给用户的 token 数。
+
+这里的 `running` 表示请求已经被接纳进运行集合，并且有自己的 KV cache block 生命周期。
+
+## 6. Step 4：T1 时 D 到达，第二轮混合 prefill 和 decode
+
+D 在 T1 到达：
+
+```text
+D -> prompt tokens = 6, max_tokens = 3
+```
+
+它先进入 waiting：
+
+```text
+waiting = [D]
+running = [A, B, C]
+```
+
+下一轮调度时，vLLM 先看 `running` 里的 A/B/C。**它们 prompt 已经算完，接下来每个请求通常推进 1 个 decode token：**
 
 ```text
 running 部分 = A(1) + B(1) + C(1) = 3 tokens
 ```
 
-此时还剩 5 个 token budget，于是 D 可以顺手吃掉 5 个 prompt token：
+本轮总预算是 8，还剩：
+
+```text
+8 - 3 = 5 tokens
+```
+
+于是调度器继续从 `waiting` 里拿 D。D 的 prompt 有 6 个 token，但本轮只剩 5 个 token 预算，所以先吃 5 个 prompt token：
+
+> 这里假设 `enable_chunked_prefill=True`，也就是 v1 scheduler 的默认行为。  
+> 如果关闭 chunked prefill，D 的 prompt 长度 6 > 剩余预算 5，调度器会先停下，不会把 D 切成 5 个 token 排进去。
 
 ```text
 waiting 部分 = D(5)
 ```
 
-于是第二轮 batch 变成：
+第二轮 batch 变成：
 
 ```text
 batch 2 = A(1) + B(1) + C(1) + D(5) = 8 tokens
 ```
 
-这就是 vLLM 的 continuous batching：**不同阶段、不同长度、不同到达时间的请求，可以在同一轮里混着跑。**
+这就是 continuous batching：
 
-### 3.3 资源不够时怎么办
+```text
+同一轮 batch 里可以同时有：
+  - 老请求的 decode token
+  - 新请求的 prefill token
+  - 不同长度、不同到达时间的请求
+```
 
-如果 `kv_cache_manager.allocate_slots(...)` 发现 KV block 不够，`Scheduler` 会尝试抢占一个 running 请求。FCFS 下通常弹出一个尾部请求；PRIORITY 下会挑最低优先级的请求。被抢占的请求会被重新放回 waiting，后面再恢复。
+## 7. Step 5：batch 里怎么知道 token 属于谁
 
-这也是为什么 vLLM 能扛高并发：不是“永不冲突”，而是“冲突时有明确的回退路径”。
+vLLM 不是靠 token 本身识别归属，而是靠 batch 元数据记录每个 request 的连续区间。
 
-### 3.4 SchedulerOutput 是什么
+对于第二轮：
 
-`schedule()` 不直接给 GPU tensor，而是生成协议对象：
+```text
+A -> 1 token
+B -> 1 token
+C -> 1 token
+D -> 5 token
+```
 
-- `scheduled_new_reqs`
-- `scheduled_cached_reqs`
-- `num_scheduled_tokens`
-- `scheduled_spec_decode_tokens`
-- `scheduled_encoder_inputs`
-- `preempted_req_ids`
-- `finished_req_ids`
+worker 侧可以整理成：
 
-这份输出是 scheduler 和 worker 的边界。scheduler 只负责说“谁、多少 token、哪些 block”；worker 负责把它翻译成真正的模型输入。
+```text
+req_ids         = [A, B, C, D]
+num_scheduled   = [1, 1, 1, 5]
+query_start_loc = [0, 1, 2, 3, 8]
+input_ids       = [A1, B1, C1, D1, D2, D3, D4, D5]
+```
 
-## 第 4 步：EngineCore.step() 驱动 worker 执行
+`query_start_loc` 是前缀和，表示每个请求在扁平 `input_ids` 里的边界：
 
-`EngineCore.step()` 的主流程是：
+| 请求 | 区间 | 含义 |
+|---|---|---|
+| A | `input_ids[0:1]` | A 本轮的 1 个 token |
+| B | `input_ids[1:2]` | B 本轮的 1 个 token |
+| C | `input_ids[2:3]` | C 本轮的 1 个 token |
+| D | `input_ids[3:8]` | D 本轮的 5 个 token |
+
+对应源码对象：
+
+| 字段 | 作用 |
+|---|---|
+| `SchedulerOutput.num_scheduled_tokens` | `req_id -> 本轮 token 数` |
+| `InputBatch.req_ids` | `batch_idx -> req_id` |
+| `InputBatch.query_start_loc` | `batch_idx -> input_ids 起止边界` |
+| `InputBatch.idx_mapping` | `batch_idx -> worker 内部 request state 下标` |
+| `ModelRunnerOutput.req_id_to_index` | 采样结果回写时用的 request 映射 |
+
+一句话：
+
+```text
+vLLM 先按 request 分段拼 tensor，再用 query_start_loc 记录每段边界。
+```
+
+## 8. Step 6：SchedulerOutput 是调度器和 worker 的协议
+
+`Scheduler.schedule()` 不直接创建 GPU tensor，而是返回 `SchedulerOutput`。
+
+对于第二轮，它可以理解成：
+
+```text
+SchedulerOutput:
+  num_scheduled_tokens:
+    A: 1
+    B: 1
+    C: 1
+    D: 5
+
+  scheduled_cached_reqs:
+    A, B, C
+
+  scheduled_new_reqs:
+    D
+
+  total_num_scheduled_tokens:
+    8
+```
+
+含义：
+
+| 字段 | 例子中的含义 |
+|---|---|
+| `scheduled_new_reqs` | D 第一次被调度，需要把完整请求信息发给 worker |
+| `scheduled_cached_reqs` | A/B/C 之前已经在 worker 中缓存过，只发增量 |
+| `num_scheduled_tokens` | 每个请求本轮推进多少 token |
+| `total_num_scheduled_tokens` | 本轮总 token 数，不能超过 `max_num_batched_tokens` |
+| `finished_req_ids` | 告诉 worker 哪些请求已经结束，可以释放缓存状态 |
+
+这个对象是边界：
+
+```text
+Scheduler 只管“谁该跑、跑多少、分到哪些 KV block”。
+Worker 负责“怎么变成 GPU tensor、怎么执行模型”。
+```
+
+## 9. Step 7：EngineCore.step() 串起一轮执行
+
+`EngineCore.step()` 是一轮推理迭代的主循环：
 
 ```python
 scheduler_output = self.scheduler.schedule()
 future = self.model_executor.execute_model(scheduler_output, non_block=True)
+grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
 model_output = future.result()
 if model_output is None:
     model_output = self.model_executor.sample_tokens(grammar_output)
@@ -187,217 +371,287 @@ engine_core_outputs = self.scheduler.update_from_output(
 )
 ```
 
-它把“调度”与“模型执行”分开了。
+这一轮实际做了四件事：
 
-## 第 5 步：GPUModelRunner.execute_model() 把 request batch 变成张量 batch
+```text
+schedule  决定这轮跑什么
+execute   跑模型前向
+sample    从 logits 得到新 token
+update    把结果写回 request 状态
+```
 
-真正把请求转成 GPU 可吃的 tensor 的，是：
+## 10. Step 8：GPUModelRunner 把调度结果变成 GPU 输入
+
+真正把 `SchedulerOutput` 转成模型输入的是：
 
 ```python
 GPUModelRunner.execute_model(...)
 ```
 
-这一步通常包含：
+核心动作：
 
-1. `finish_requests(scheduler_output)`
-2. `free_states(scheduler_output)`
-3. `add_requests(scheduler_output)`
-4. `update_requests(scheduler_output)`
-5. `block_tables.apply_staged_writes()`
-6. `dispatch_cg_and_sync_dp(...)`
-7. `prepare_inputs(...)`
-8. `prepare_attn(...)`
-9. `model(**model_inputs)` 或 `cudagraph_manager.run_fullgraph(...)`
+| 动作 | 作用 |
+|---|---|
+| `finish_requests(scheduler_output)` | 清理已经结束的请求 |
+| `free_states(scheduler_output)` | 释放 worker 侧状态 |
+| `add_requests(scheduler_output)` | 把新请求加入 worker 缓存 |
+| `update_requests(scheduler_output)` | 更新老请求的增量 token |
+| `prepare_inputs(...)` | 生成 `input_ids`、`positions`、`query_start_loc` |
+| `prepare_attn(...)` | 生成 `block_tables`、`slot_mappings`、`attn_metadata` |
+| `model(**model_inputs)` | 执行 Transformer forward |
 
-### 5.1 输入准备
+### 10.1 为什么需要 block table 和 slot mapping
 
-`prepare_inputs(...)` 会把请求列表压平为：
+Scheduler 只知道请求持有哪些 KV block，例如：
 
-- `input_ids`
-- `positions`
-- `req_ids`
-- `num_scheduled_tokens`
-- `slot_mapping`
+```text
+A -> blocks [10]
+B -> blocks [11]
+C -> blocks [12]
+D -> blocks [20]
+```
 
-### 5.2 attention 元数据
+attention kernel 需要的是更底层的地址信息：
 
-`prepare_attn(...)` 会准备：
+```text
+这个 token 的 K/V 应该写到哪个 block 的哪个 slot？
+这个请求历史上的 K/V 应该从哪些 block 读取？
+```
 
-- `block_tables`
-- `slot_mappings`
-- `attn_metadata`
+所以 worker 要把请求级 block 信息翻译成：
 
-这一步把“请求级 KV cache block”翻译成“attention kernel 能读懂的地址表”。
+```text
+block_tables   请求 -> 物理 block 列表
+slot_mappings  本轮每个 token -> KV cache 写入位置
+attn_metadata  attention backend 需要的所有元数据
+```
 
-### 5.3 模型前向
+### 10.2 mixed batch 在 Transformer 里为什么不会串
 
-最后进入模型 forward。这里不会再看“这是哪个用户”，只看一个 batch 里的 tensor。
+第二轮的 mixed batch 进入 embedding 后，会变成一个矩阵：
 
-如果开了 CUDA graph，就走 `run_fullgraph`；否则直接 `model(**model_inputs)`。
+```text
+input_ids      = [A1, B1, C1, D1, D2, D3, D4, D5]
+hidden_states  = embedding(input_ids)
+hidden_states.shape = [8, hidden_size]
+```
 
-## 第 6 步：sample_tokens() 产出下一 token
+这个矩阵里确实混着多个 request。但大多数 Transformer 层是逐 token 独立计算的，例如 RMSNorm、Linear、MLP：
 
-模型前向得到 hidden states 后，最后一层会进入：
+```text
+Y = X @ W
+
+Y[0] = X[0] @ W  # A
+Y[1] = X[1] @ W  # B
+Y[2] = X[2] @ W  # C
+Y[3] = X[3] @ W  # D1
+...
+```
+
+这些操作只是批量处理多行，不会让 A 的 hidden state 读到 B 或 D。
+
+真正可能跨 token 交互的是 self-attention。逻辑上，如果不加限制，`Q @ K.T` 会让所有 token 互相看见。vLLM 通过 attention metadata 把不同 request 隔开：
+
+```text
+query_start_loc = [0, 1, 2, 3, 8]
+
+A: input_ids[0:1]  只能读 A 的 KV blocks
+B: input_ids[1:2]  只能读 B 的 KV blocks
+C: input_ids[2:3]  只能读 C 的 KV blocks
+D: input_ids[3:8]  只能读 D 的 KV blocks，并在 D 内部使用 causal mask
+```
+
+逻辑 attention 可见性可以理解成：
+
+```text
+        A_hist A1 | B_hist B1 | C_hist C1 | D1 D2 D3 D4 D5
+A1        1   1  |   0   0  |   0   0  | 0  0  0  0  0
+B1        0   0  |   1   1  |   0   0  | 0  0  0  0  0
+C1        0   0  |   0   0  |   1   1  | 0  0  0  0  0
+D1        0   0  |   0   0  |   0   0  | 1  0  0  0  0
+D2        0   0  |   0   0  |   0   0  | 1  1  0  0  0
+D3        0   0  |   0   0  |   0   0  | 1  1  1  0  0
+D4        0   0  |   0   0  |   0   0  | 1  1  1  1  0
+D5        0   0  |   0   0  |   0   0  | 1  1  1  1  1
+```
+
+实际实现通常不会构造这么大的 dense mask，而是把 `query_start_loc`、`seq_lens`、`block_tables`、`slot_mappings`、`positions` 传给高性能 attention kernel。kernel 按这些元数据只访问合法的 K/V：
+
+```text
+普通层：逐 token 独立，天然不串。
+Attention：按 request 边界和 KV block 表读取，只在同一 request 内做 causal attention。
+```
+
+## 11. Step 9：模型前向和采样
+
+模型前向可能走两条路：
+
+```text
+普通路径: model(**model_inputs)
+CUDA graph 路径: cudagraph_manager.run_fullgraph(...)
+```
+
+前向结束后，最后一个 pipeline stage 会执行：
 
 ```python
 GPUModelRunner.sample_tokens(...)
 ```
 
-这里完成：
+它会：
 
-1. `Sampler.sample(...)`
-2. `PromptLogprobsWorker.compute_prompt_logprobs(...)`
-3. 多卡/流水线场景下的广播或回收
-4. 生成 `ModelRunnerOutput`
+1. 根据 hidden states 计算 logits
+2. 按 sampling 参数采样 token
+3. 生成 `ModelRunnerOutput`
+4. 更新 worker 内部 request state
 
-如果是最后一个 PP rank，就直接采样；如果不是最后一个 PP rank，则先收发中间结果，再由末端统一采样。
-
-对用户来说，这一步的结果就是：
+第二轮中，采样结果可能是：
 
 ```text
-A 生成一个新 token
-B 生成一个新 token
-C 生成一个新 token
-D 可能还在补 prefill
+A -> token a1
+B -> token b1
+C -> token c1
+D -> 仍在 prefill，暂时没有输出 token
 ```
 
-## 第 7 步：Scheduler.update_from_output() 回写状态
+注意：prefill 请求不一定每个 chunk 都立刻返回用户可见 token。D 本轮只完成了前 5 个 prompt token，完整 prompt 还有 1 个 token 没算完，因此它通常还不会采样输出。
 
-模型返回后，调度器把结果写回请求状态：
+## 12. Step 10：Scheduler.update_from_output() 回写请求状态
+
+模型输出回到调度器后，调用：
 
 ```python
 Scheduler.update_from_output(scheduler_output, model_runner_output)
 ```
 
-核心动作是：
+调度器会按 `req_id` 回写：
 
-1. 按 `req_id` 找到请求
-2. `Request.append_output_token_ids(...)`
-3. `check_stop(...)`
-4. 更新 `num_computed_tokens`
-5. 处理 stop / max_tokens / stop string
-6. 释放完成请求的 KV 和 encoder 状态
-
-如果某个请求已经结束，后续会被移出运行集合；如果还没结束，它会保留在 `running` 中，下一轮继续推进。
-
-### 7.1 这里为什么能知道哪个 token 属于谁
-
-因为 `SchedulerOutput.num_scheduled_tokens` 和 `ModelRunnerOutput.req_id_to_index` 都保留了请求顺序映射。这样 batch 里混了很多请求，回写时也能一一对上。
-
-### 7.2 结束条件
-
-请求可能因为这些原因结束：
-
-- 生成到 `max_tokens`
-- 遇到 stop string
-- 遇到 stop token
-- 被外部 abort
-- 发生错误
-
-结束后，调度器会标记 finished，并准备释放相关状态。
-
-## 第 8 步：OutputProcessor 把 token 变成用户可读文本
-
-`Scheduler.update_from_output(...)` 之后，`EngineCoreOutputs` 会被送回 API 侧。`AsyncLLM` 的后台任务：
-
-```python
-AsyncLLM._run_output_handler()
+```text
+A: append_output_token_ids(a1)
+B: append_output_token_ids(b1)
+C: append_output_token_ids(c1)
+D: num_computed_tokens 增加 5，但还没生成输出 token
 ```
 
-会持续执行：
+同时检查停止条件：
+
+| 停止条件 | 例子 |
+|---|---|
+| 达到 `max_tokens` | C 最多生成 2 个，生成满后结束 |
+| 遇到 stop token | 例如 EOS |
+| 遇到 stop string | 输出文本命中停止字符串 |
+| 用户中断 | 客户端断开，API 调用 abort |
+| 错误 | 模型或执行异常 |
+
+如果请求结束，调度器会释放它的 KV cache block，并从 `running` 中移除。
+
+## 13. Step 11：OutputProcessor 把 token 返回给用户
+
+`Scheduler.update_from_output()` 生成 `EngineCoreOutputs` 后，API 侧后台任务会持续拉取：
 
 ```python
 engine_core.get_output_async()
 output_processor.process_outputs(...)
 ```
 
-`OutputProcessor.process_outputs(...)` 会做三件事：
+`OutputProcessor.process_outputs(...)` 做三件事：
 
-1. detokenize token ids
-2. 更新 logprobs / metrics
-3. 生成 `RequestOutput`，放进对应请求的 `RequestOutputCollector`
+| 动作 | 说明 |
+|---|---|
+| detokenize | 把 token id 转成文本 |
+| 组装 `RequestOutput` | 包含 text、token_ids、logprobs、finish_reason |
+| 放入请求自己的队列 | `RequestOutputCollector.put(...)` |
 
-于是 A/B/C/D 各自的 `generate()` 协程，只会收到自己的结果，不会串台。
-
-## 用时间线把上面的例子串起来
-
-### T0：A/B/C 同时到达
+所以这一轮结束后：
 
 ```text
-waiting = [A, B, C]
-running = []
+RequestOutputCollector(A) 收到 A 的新文本
+RequestOutputCollector(B) 收到 B 的新文本
+RequestOutputCollector(C) 收到 C 的新文本
+RequestOutputCollector(D) 暂时没有可见输出
 ```
 
-调度后：
+用户侧的 `AsyncLLM.generate()` 是一个异步生成器，会不断从自己的 collector 里取结果并 yield：
 
 ```text
-batch 1 = A(3) + B(2) + C(3)
-running = [A, B, C]
+用户 A 只看到 A 的流式输出
+用户 B 只看到 B 的流式输出
+用户 C 只看到 C 的流式输出
+用户 D 等 prefill 完成后才开始看到输出
 ```
 
-### T1：D 到达
+## 14. 把时间线压缩成一张表
+
+| 时间 | waiting | running | 本轮 batch | 输出 |
+|---|---|---|---|---|
+| T0 前 | `[A, B, C]` | `[]` | 还未调度 | 无 |
+| T0 调度 | `[]` | `[A, B, C]` | `A(3)+B(2)+C(3)=8` | 通常会顺便采样出 A/B/C 各自的首个输出 token |
+| T1 前 | `[D]` | `[A, B, C]` | 还未调度 | 无 |
+| T1 调度 | `[]` 或 `[D剩余]` | `[A, B, C, D]` | `A(1)+B(1)+C(1)+D(5)=8` | A/B/C 各可能输出 1 token |
+| T2 以后 | 视完成情况变化 | 未完成请求继续保留 | 继续混排 prefill/decode | 完成的请求释放 KV |
+
+这个表就是 vLLM 高并发推理的核心：
 
 ```text
-waiting = [D]
-running = [A, B, C]
+请求不断到达
+请求不断完成
+调度器每轮重新拼 batch
+GPU 每轮尽量吃满 token budget
 ```
 
-调度后：
+## 15. 资源不够时怎么办
+
+如果 `kv_cache_manager.allocate_slots(...)` 发现 KV cache block 不够，scheduler 会尝试抢占请求：
 
 ```text
-batch 2 = A(1) + B(1) + C(1) + D(5)
-running = [A, B, C, D]
+KV block 不够
+  -> 找一个可抢占 request
+  -> 从 running 移除
+  -> 放回 waiting
+  -> 释放或延迟释放相关资源
+  -> 后面再恢复或重算
 ```
 
-### T2：继续推进
+FCFS 下通常抢占尾部请求；PRIORITY 下会优先抢占低优先级请求。
 
-接下来每一轮都重复同一件事：
+这说明 vLLM 的高并发不是“无限塞请求”，而是在这些约束中做动态平衡：
 
-1. `schedule()` 先推进 running
-2. 余下 token budget 再喂 waiting
-3. `execute_model()` 跑前向
-4. `sample_tokens()` 采样
-5. `update_from_output()` 回写
-6. `OutputProcessor` 发回各自的流
+```text
+max_num_seqs
+max_num_batched_tokens
+KV cache block 数
+LoRA 数量限制
+encoder / multimodal budget
+priority / FCFS 策略
+```
 
-这就是 vLLM 为什么能在高并发下维持吞吐：**不是让请求排队等前一个完全结束，而是把每一轮 token 预算尽量填满。**
+## 16. 关键源码位置
 
-## 关键原则
+| 主题 | 文件 |
+|---|---|
+| 异步入口 | `vLLM/vllm-upstream/vllm/v1/engine/async_llm.py` |
+| 引擎主循环 | `vLLM/vllm-upstream/vllm/v1/engine/core.py` |
+| 请求对象 | `vLLM/vllm-upstream/vllm/v1/request.py` |
+| 调度器 | `vLLM/vllm-upstream/vllm/v1/core/sched/scheduler.py` |
+| 请求队列 | `vLLM/vllm-upstream/vllm/v1/core/sched/request_queue.py` |
+| 调度输出 | `vLLM/vllm-upstream/vllm/v1/core/sched/output.py` |
+| GPU runner | `vLLM/vllm-upstream/vllm/v1/worker/gpu/model_runner.py` |
+| InputBatch | `vLLM/vllm-upstream/vllm/v1/worker/gpu/input_batch.py` |
+| 输出处理 | `vLLM/vllm-upstream/vllm/v1/engine/output_processor.py` |
 
-1. **请求和 batch 解耦**
-   - 每个请求先有自己的 `RequestState`
-   - 真正执行时再被 scheduler 混成 batch
+## 17. 和 mini-vLLM 的对应关系
 
-2. **调度和执行解耦**
-   - `SchedulerOutput` 只描述“要跑什么”
-   - worker 才负责真正算 tensor
+| vLLM 概念 | mini-vLLM 路径 | 学习重点 |
+|---|---|---|
+| Scheduler | `mini-vllm/src/myvllm/engine/scheduler.py` | waiting/running、token budget、preemption |
+| KV block 管理 | `mini-vllm/src/myvllm/engine/block_manager.py` | block 分配、释放、append |
+| ModelRunner | `mini-vllm/src/myvllm/engine/model_runner.py` | 把调度结果变成模型输入 |
+| Attention | `mini-vllm/src/myvllm/layers/attention.py` | prefill/decode、KV cache 使用 |
+| Linear | `mini-vllm/src/myvllm/layers/linear.py` | TP 行并行、列并行、权重加载 |
 
-3. **输出和请求回收解耦**
-   - `OutputProcessor` 把结果转成用户可读输出
-   - 结束请求会被单独清理，不影响其他请求
+一句话总结：
 
-4. **连续批处理**
-   - 新来的请求不必等旧请求结束
-   - running 和 waiting 可以在同一轮里混跑
-
-5. **KV cache 是核心资源**
-   - 不是单纯算力问题
-   - `allocate_slots()` 能不能成功，直接决定这轮能不能推进
-
-## 推荐继续看的源码
-
-- `vLLM/vllm-upstream/vllm/v1/engine/async_llm.py`
-- `vLLM/vllm-upstream/vllm/v1/engine/core.py`
-- `vLLM/vllm-upstream/vllm/v1/core/sched/scheduler.py`
-- `vLLM/vllm-upstream/vllm/v1/core/sched/request_queue.py`
-- `vLLM/vllm-upstream/vllm/v1/worker/gpu/model_runner.py`
-- `vLLM/vllm-upstream/vllm/v1/engine/output_processor.py`
-
-如果要把这篇文档和 mini-vLLM 对照起来，最值得看的对应关系是：
-
-- `engine/scheduler.py`
-- `engine/block_manager.py`
-- `engine/model_runner.py`
-- `layers/attention.py`
-- `layers/linear.py`
-
+```text
+vLLM 的请求处理不是“一个用户一个 batch”，而是“所有用户共享一个动态 token 调度池”。
+Scheduler 决定每轮 token 怎么混排，GPUModelRunner 负责把混排结果变成 tensor，
+OutputProcessor 再把采样结果按 request_id 分发回各自用户。
+```
